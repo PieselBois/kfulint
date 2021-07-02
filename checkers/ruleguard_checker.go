@@ -2,6 +2,7 @@ package checkers
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -30,8 +31,12 @@ func init() {
 			Usage: "enable debug for the specified named rules group",
 		},
 		"failOnError": {
-			Value: false,
-			Usage: "If true, panic when the gorule files contain a syntax error. If false, log and skip rules that contain an error",
+			Value: "",
+			Usage: `Determines the behavior when an error occurs while parsing ruleguard files.
+If flag is not set, log error and skip rule files that contain an error.
+If flag is set, the value must be a comma-separated list of error conditions.
+* 'import': rule refers to a package that cannot be loaded.
+* 'dsl':    gorule file does not comply with the ruleguard DSL.`,
 		},
 	}
 	info.Summary = "Runs user-defined rules using ruleguard linter"
@@ -45,6 +50,56 @@ func init() {
 	})
 }
 
+// parseErrorHandler is used to determine whether to ignore or fail ruleguard parsing errors.
+type parseErrorHandler struct {
+	// failureConditions is a map of predicates which are evaluated against a ruleguard parsing error.
+	// If at least one predicate returns true, then an error is returned.
+	// Otherwise, the ruleguard file is skipped.
+	failureConditions map[string]func(err error) bool
+}
+
+// failOnParseError returns true if a parseError occurred and that error should be not be ignored.
+func (e parseErrorHandler) failOnParseError(parseError error) bool {
+	for k, p := range e.failureConditions {
+		log.Printf("EVALUATING: %v for %v", k, parseError)
+		if p(parseError) {
+			log.Printf("FAIL: %v", parseError)
+			return true
+		}
+	}
+	return false
+}
+
+func newErrorHandler(failOnErrorFlag string) (*parseErrorHandler, error) {
+	h := parseErrorHandler{
+		failureConditions: make(map[string]func(err error) bool),
+	}
+	var failOnErrorPredicates = map[string]func(error) bool{
+		"dsl":    func(err error) bool { var e *ruleguard.ImportError; return !errors.As(err, &e) },
+		"import": func(err error) bool { var e *ruleguard.ImportError; return errors.As(err, &e) },
+		"all":    func(err error) bool { return true },
+	}
+	for _, k := range strings.Split(failOnErrorFlag, ",") {
+		if k == "" {
+			continue
+		}
+		log.Printf("FLAG: %v", k)
+		if p, ok := failOnErrorPredicates[k]; ok {
+			log.Printf("ADDING FLAG: %v", k)
+			h.failureConditions[k] = p
+		} else {
+			// Wrong flag value.
+			supportedValues := []string{}
+			for key := range failOnErrorPredicates {
+				supportedValues = append(supportedValues, key)
+			}
+			return nil, fmt.Errorf("ruleguard init error: 'failOnError' flag '%s' is invalid. It must be a comma-separated list and supported values are '%s'",
+				k, strings.Join(supportedValues, ","))
+		}
+	}
+	return &h, nil
+}
+
 func newRuleguardChecker(info *linter.CheckerInfo, ctx *linter.CheckerContext) (*ruleguardChecker, error) {
 	c := &ruleguardChecker{
 		ctx:        ctx,
@@ -54,13 +109,10 @@ func newRuleguardChecker(info *linter.CheckerInfo, ctx *linter.CheckerContext) (
 	if rulesFlag == "" {
 		return c, nil
 	}
-	failOnErrorFlag := info.Params.Bool("failOnError")
-
-	// TODO(quasilyte): handle initialization errors better when we make
-	// a transition to the go/analysis framework.
-	//
-	// For now, we log error messages and return a ruleguard checker
-	// with an empty rules set.
+	h, err := newErrorHandler(info.Params.String("failOnError"))
+	if err != nil {
+		return nil, err
+	}
 
 	engine := ruleguard.NewEngine()
 	fset := token.NewFileSet()
@@ -78,21 +130,22 @@ func newRuleguardChecker(info *linter.CheckerInfo, ctx *linter.CheckerContext) (
 			log.Printf("ruleguard init error: %+v", err)
 			continue
 		}
+		if len(filenames) == 0 {
+			return nil, fmt.Errorf("ruleguard init error: no file matching '%s'", strings.TrimSpace(filePattern))
+		}
 		for _, filename := range filenames {
 			data, err := ioutil.ReadFile(filename)
 			if err != nil {
-				if failOnErrorFlag {
+				if h.failOnParseError(err) {
 					return nil, fmt.Errorf("ruleguard init error: %+v", err)
 				}
-				log.Printf("ruleguard init error: %+v", err)
-				continue
+				log.Printf("ruleguard init error, skip %s: %+v", filename, err)
 			}
 			if err := engine.Load(parseContext, filename, bytes.NewReader(data)); err != nil {
-				if failOnErrorFlag {
+				if h.failOnParseError(err) {
 					return nil, fmt.Errorf("ruleguard init error: %+v", err)
 				}
-				log.Printf("ruleguard init error: %+v", err)
-				continue
+				log.Printf("ruleguard init error, skip %s: %+v", filename, err)
 			}
 			loaded++
 		}

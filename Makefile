@@ -1,4 +1,4 @@
-.PHONY: test test-checker test-goroot docs ci ci-tidy ci-tests ci-linter cover install
+.PHONY: test test-checker test-goroot docs ci ci-tidy ci-tests ci-linter cover install gen-checker
 
 GOPATH_DIR=`go env GOPATH`
 
@@ -48,3 +48,53 @@ gocritic:
 
 install:
 	go install ./cmd/gocritic
+
+TEST_DIR=checkers/testdata/$(CHECKER_NAME)
+ifeq ($(CHECKER_TYPE),)
+CHECKER_TYPE_NAME=Expr
+CHECKER_TYPE=expr ast.Expr
+endif
+ifeq ($(CHECKER_CATEGORY),)
+CHECKER_CATEGORY=diagnostic
+endif
+
+define CHECKER_BODY
+package checkers
+
+import (
+	"go/ast"
+
+	"github.com/go-critic/go-critic/checkers/internal/astwalk"
+	"github.com/go-critic/go-critic/framework/linter"
+)
+
+func init() {
+	var info linter.CheckerInfo
+	info.Name = "$(CHECKER_NAME)"
+	info.Tags = []string{"$(CHECKER_CATEGORY)", "experimental"}
+	info.Summary = "Write your summary here."
+	info.Before = ``
+	info.After = ``
+
+	collection.AddChecker(&info, func(ctx *linter.CheckerContext) linter.FileWalker {
+		return astwalk.WalkerFor$(CHECKER_TYPE_NAME)(&$(CHECKER_NAME)Checker{ctx: ctx})
+	})
+}
+
+type $(CHECKER_NAME)Checker struct {
+	astwalk.WalkHandler
+	ctx *linter.CheckerContext
+}
+
+func (c *$(CHECKER_NAME)Checker) Visit$(CHECKER_TYPE_NAME)($(CHECKER_TYPE)) {
+	// your code goes here
+}
+endef
+
+export CHECKER_BODY
+
+gen-checker:
+	mkdir $(TEST_DIR)
+	echo "package checker_test" > $(TEST_DIR)/negative_tests.go
+	echo "package checker_test" > $(TEST_DIR)/positive_tests.go
+	echo "$$CHECKER_BODY" > checkers/$(CHECKER_NAME)_checker.go
